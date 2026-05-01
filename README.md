@@ -8,13 +8,13 @@ Let's start by adding PieSocket Android SDK as a dependency to your application.
 ### Gradle (Kotlin)
 
 ```
-implementation("com.piesocket:channels-sdk:1.0.5")
+implementation("com.piesocket:channels-sdk:2.1.0")
 ```
 
 ### Gradle (Java)
 
 ```
-implementation 'com.piesocket:channels-sdk:1.0.5'
+implementation 'com.piesocket:channels-sdk:2.1.0'
 ```
 
 ### Maven
@@ -22,7 +22,7 @@ implementation 'com.piesocket:channels-sdk:1.0.5'
 <dependency>
     <groupId>com.piesocket</groupId>
     <artifactId>channels-sdk</artifactId>
-    <version>1.0.5</version>
+    <version>2.1.0</version>
 </dependency>
 ```
 
