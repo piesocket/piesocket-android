@@ -67,7 +67,11 @@ public class Channel extends WebSocketListener implements Callback {
             return this.options.getWebSocketEndpoint();
         }
 
-        String endpoint = "wss://" + this.options.getClusterId() + ".piesocket.com/v" + this.options.getVersion() + "/" + this.id + "?api_key=" + this.options.getApiKey() + "&notify_self=" + this.options.getNotifySelf() + "&source=androidsdk&v=1&presence="+ this.options.getPresence();
+        String clusterDomain = this.options.getClusterDomain() != null
+                ? this.options.getClusterDomain()
+                : this.options.getClusterId() + ".piesocket.com";
+        String protocol = this.options.getSsl() ? "wss" : "ws";
+        String endpoint = protocol + "://" + clusterDomain + "/v" + this.options.getVersion() + "/" + this.id + "?api_key=" + this.options.getApiKey() + "&notify_self=" + this.options.getNotifySelf() + "&source=androidsdk&v=1&presence="+ this.options.getPresence();
 
         String jwt = this.getAuthToken();
         if(jwt != null){

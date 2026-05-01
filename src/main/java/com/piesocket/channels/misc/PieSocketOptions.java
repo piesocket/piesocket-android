@@ -16,6 +16,8 @@ public class PieSocketOptions {
     private String userId;
     private String version;
     private String webSocketEndpoint;
+    private String clusterDomain;
+    private Boolean ssl;
 
     public PieSocketOptions(){
         this.version = "3";
@@ -23,6 +25,7 @@ public class PieSocketOptions {
         this.notifySelf = true;
         this.presence = false;
         this.forceAuth = false;
+        this.ssl = true;
     }
 
     public String getWebSocketEndpoint() {
@@ -119,6 +122,22 @@ public class PieSocketOptions {
 
     public void setUserId(String userId) {
         this.userId = userId;
+    }
+
+    public String getClusterDomain() {
+        return clusterDomain;
+    }
+
+    public void setClusterDomain(String clusterDomain) {
+        this.clusterDomain = clusterDomain;
+    }
+
+    public Boolean getSsl() {
+        return ssl;
+    }
+
+    public void setSsl(Boolean ssl) {
+        this.ssl = ssl;
     }
 
 }

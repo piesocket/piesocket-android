@@ -1,21 +1,18 @@
-# Java WebSockets Client For Android
+# PieSocket Realtime SDK for Android
 
-PieSocket's Android SDK for WebSockets written in Java.
-
-
-This SDK can be used to communicate with any third-party WebSocket server,
-and implements auto-reconnection among other best WebSocket practices.
-
+PieSocket Realtime SDK for Android written in Java.
 
 ## Installation
 Let's start by adding PieSocket Android SDK as a dependency to your application. 
 
 ### Gradle (Kotlin)
+
 ```
 implementation("com.piesocket:channels-sdk:1.0.5")
 ```
 
 ### Gradle (Java)
+
 ```
 implementation 'com.piesocket:channels-sdk:1.0.5'
 ```
@@ -30,28 +27,12 @@ implementation 'com.piesocket:channels-sdk:1.0.5'
 ```
 
 ## Permissions
-Setup manifest permissions as instructed [here](https://www.piesocket.com/docs/3.0/android-websockets#permissions).
+
+Setup manifest permissions as instructed [here](https://piehost.com/docs/3.0/android-websockets#permissions).
 
 ## Usage
 
-### Stand-alone Usage
-Create a Channel instance as shown below.
-
-```java
-Channel channel = new Channel("wss://example.com", true);
-
-channel.listen("system:connected", new PieSocketEventListener() {
-  @Override
-  public void handleEvent(PieSocketEvent event) {
-
-    //WebSocket Connected
-    channel.send("Hello");
-
-  }
-});
-```
-
-### Use PieSocket's managed WebSocket server
+### Managed PieSocket Server
 Use following code to create a Channel with PieSocket's managed WebSocket servers.
 
 Get your API key and Cluster ID here: [Get API Key](https://www.piesocket.com/app/v4/register)
@@ -60,6 +41,19 @@ Get your API key and Cluster ID here: [Get API Key](https://www.piesocket.com/ap
 PieSocketOptions options = new PieSocketOptions();
 options.setClusterId("demo");
 options.setApiKey("VCXCEuvhGcBDP7XhiJJUDvR1e1D3eiVjgZ9VRiaV");
+
+PieSocket piesocket = new PieSocket(options);
+Channel channel = piesocket.join("chat-room-1");
+```
+
+### Self-hosted PieSocket Server
+Use following code to create a Channel with PieSocket self-hosted realtime servers.
+
+
+```java
+PieSocketOptions options = new PieSocketOptions();
+options.setClusterDomain("localhost:4001");
+options.setSsl(false);
 
 PieSocket piesocket = new PieSocket(options);
 Channel channel = piesocket.join("chat-room-1");
@@ -76,10 +70,9 @@ Channel channel = piesocket.join("chat-room-1");
   - Authentication
   - Upto 60% cost savings
 
-We highly recommend using PieSocket Channels over self hosted WebSocket servers for production applications.
 
 ## Events
 `system:connected` is the event fired when WebSocket connection is ready, get a full list system messages here: [PieSocket System Messages](https://www.piesocket.com/docs/3.0/events#system-events)
 
 ## Documentation
-For usage examples and more information, refer to: [Official SDK docs](https://www.piesocket.com/docs/3.0/android-websockets)
+For usage examples and more information, refer to: [Official SDK docs](https://www.piehost.com/docs/3.0/android-websockets)
