@@ -2,7 +2,7 @@ import com.vanniktech.maven.publish.SonatypeHost
 
 plugins {
     id 'com.android.library'
-    id "com.vanniktech.maven.publish" version "0.22.0"
+    id "com.vanniktech.maven.publish" version "0.28.0"
 }
 
 android {
@@ -64,8 +64,10 @@ mavenPublishing {
             developerConnection = "scm:git:ssh://git@github.com/piesocket/websocket-android-client.git"
         }
     }
-    publishToMavenCentral(SonatypeHost.S01)
+
+    publishToMavenCentral(SonatypeHost.CENTRAL_PORTAL)
     signAllPublications()
+
 }
 
 
