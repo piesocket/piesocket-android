@@ -193,6 +193,14 @@ public class Channel extends WebSocketListener implements Callback {
     public void disconnect() {
         this.shouldReconnect = false;
 
+        // Tear down WebRTC before dropping the channel, so the camera/mic stop
+        // and peer connections close instead of streaming on headless.
+        if (this.pieRTC != null) {
+            PieRTC rtc = this.pieRTC;
+            this.pieRTC = null;
+            rtc.dispose();
+        }
+
         if (this.hub != null) {
             // A multiplexed secondary channel has no socket of its own — the
             // primary/promotion dance lives in PieSocket.leave(), which only
@@ -477,6 +485,9 @@ public class Channel extends WebSocketListener implements Callback {
                 } else {
                     this.members = data.optJSONArray("members") != null
                             ? data.getJSONArray("members") : new JSONArray();
+                }
+                if (this.pieRTC != null) {
+                    this.pieRTC.onMemberJoined();
                 }
             } else if (name.equals(memberLeftEvent)) {
                 JSONObject data = new JSONObject(event.getData());

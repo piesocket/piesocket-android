@@ -203,6 +203,14 @@ public class PieSocket {
         Channel channel = this.rooms.get(roomId);
         Connection conn = this.connection;
 
+        // Stop any WebRTC media now, regardless of which teardown path runs
+        // below (the primary-promotion branch doesn't call channel.disconnect()).
+        if (channel.pieRTC != null) {
+            PieRTC rtc = channel.pieRTC;
+            channel.pieRTC = null;
+            rtc.dispose();
+        }
+
         if (conn != null && channel.hub != null) {
             if (roomId.equals(conn.primaryChannelId)) {
                 List<String> others = new ArrayList<>();

@@ -8,13 +8,13 @@ Let's start by adding PieSocket Android SDK as a dependency to your application.
 ### Gradle (Kotlin)
 
 ```
-implementation("com.piesocket:channels-sdk:7.0.0")
+implementation("com.piesocket:channels-sdk:7.1.0")
 ```
 
 ### Gradle (Java)
 
 ```
-implementation 'com.piesocket:channels-sdk:7.0.0'
+implementation 'com.piesocket:channels-sdk:7.1.0'
 ```
 
 ### Maven
@@ -22,7 +22,7 @@ implementation 'com.piesocket:channels-sdk:7.0.0'
 <dependency>
     <groupId>com.piesocket</groupId>
     <artifactId>channels-sdk</artifactId>
-    <version>7.0.0</version>
+    <version>7.1.0</version>
 </dependency>
 ```
 
@@ -115,19 +115,34 @@ room.
 PieRTCOptions rtc = new PieRTCOptions(getApplicationContext());
 rtc.video = true;
 rtc.audio = true;
+rtc.cameraFacing = "user"; // "user" (front, default) or "environment" (rear)
 rtc.onLocalVideo = (stream, pieRTC) -> { /* stream.videoTracks.get(0).addSink(renderer) */ };
 rtc.onParticipantJoined = (uuid, stream) -> { /* attach remote stream */ };
 rtc.onParticipantLeft = uuid -> { /* remove renderer */ };
 
 Channel room = piesocket.join("video-room", rtc);
+
+// Flip the camera on the live call (no renegotiation):
+room.pieRTC.switchCamera(isFront -> { /* room.pieRTC.isFrontCamera() */ });
 ```
 
 - `PieRTCOptions.context` is **required**.
 - `pieRTC.getEglBaseContext()` feeds `SurfaceViewRenderer.init(...)`.
+- Negotiation is **collision-free**: for each peer pair the client with the
+  larger uuid is the sole offerer and the other side only answers (it sends
+  `rtc::renegotiate` to ask for a fresh offer when it adds a track), so a
+  symmetric 1:1 call connects without SDP glare. Announcements re-fire on every
+  `member_joined`, so a late joiner is always picked up. `onParticipantJoined`
+  fires once per remote stream, for audio-only peers too.
+- **Camera:** `cameraFacing` picks the starting lens;
+  `pieRTC.switchCamera(cb)` flips it live and reports the new
+  `pieRTC.isFrontCamera()`.
 - **`pieRTC.shareScreen()`** — one call. The SDK runs the `MediaProjection`
   permission prompt and the foreground service itself (both declared in the
   SDK manifest, merged automatically); `pieRTC.stopScreenShare()` stops.
-- `pieRTC.dispose()` / `piesocket.leave(room)` releases native resources.
+- `piesocket.leave(room)` calls `pieRTC.dispose()` — it closes every peer
+  connection and **stops the local camera and microphone**. Idempotent, and
+  also exposed for manual use.
 
 Manifest permissions for PieRTC:
 

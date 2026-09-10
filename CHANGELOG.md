@@ -1,5 +1,37 @@
 # Changelog
 
+## 7.1.0
+
+### Fixed
+
+**PieRTC 1:1 calls now actually connect.** The handshake had several bugs:
+
+- **Join race** — a client that announced `rtc::broadcaster` before the other
+  party joined was never heard, and neither side started negotiating. PieRTC
+  now re-announces on every `member_joined`.
+- **Dependence on `onRenegotiationNeeded`** — the first offer relied on the
+  native renegotiation callback, which is unreliable on mobile. Offers are now
+  sent explicitly from the signalling handler.
+- **SDP glare** — both peers created an offer at once and each rejected the
+  other's. For every peer pair the client with the larger uuid is now the sole
+  offerer; the other side only answers, and pokes the offerer with the new
+  `rtc::renegotiate` frame when it needs a fresh offer.
+- At most one `PeerConnection` per remote peer; ICE candidates that arrive
+  before the remote description is applied are buffered and flushed;
+  `onParticipantJoined` fires for audio-only peers too, once per remote stream.
+
+**Leaving a PieRTC room now tears it down.** `piesocket.leave()` /
+`channel.disconnect()` call `pieRTC.dispose()`, which closes every peer
+connection and **stops the local camera and microphone** — previously they
+kept capturing after the call ended. `dispose()` is idempotent.
+
+### Added
+
+- **Camera controls** — `PieRTCOptions.cameraFacing` (`"user"` /
+  `"environment"`, default `"user"`) picks the starting lens.
+  `pieRTC.switchCamera(callback)` flips front ⇄ rear on the live call (no
+  renegotiation); `pieRTC.isFrontCamera()` reports the current lens.
+
 ## 7.0.0
 
 Version realigned to match the other PieSocket client SDKs (piesocket-js,

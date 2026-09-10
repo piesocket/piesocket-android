@@ -15,6 +15,7 @@ import org.webrtc.AudioTrack;
 import org.webrtc.Camera1Enumerator;
 import org.webrtc.Camera2Enumerator;
 import org.webrtc.CameraEnumerator;
+import org.webrtc.CameraVideoCapturer;
 import org.webrtc.DefaultVideoDecoderFactory;
 import org.webrtc.DefaultVideoEncoderFactory;
 import org.webrtc.EglBase;
@@ -33,9 +34,11 @@ import org.webrtc.VideoCapturer;
 import org.webrtc.VideoSource;
 import org.webrtc.VideoTrack;
 
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -43,17 +46,39 @@ import java.util.concurrent.Executors;
 /**
  * PieRTC — programmable WebRTC video/audio rooms over a v4 {@link Channel}.
  *
- * <p>Method-for-method port of piesocket-js's {@code PieRTC.js} /
- * piesocket-flutter's {@code pie_rtc.dart}, adapted to the {@code org.webrtc}
- * API. Signalling rides the channel via {@link Channel#publishEvent} on the
- * same {@code rtc::} namespace those SDKs use — a plain PieSocket relay, no
- * server-side special-casing — so an Android, a Flutter and a JS client can
- * all be mixed in one room.
+ * <p>Port of piesocket-js's {@code PieRTC.js} / piesocket-flutter's
+ * {@code pie_rtc.dart}, adapted to the {@code org.webrtc} API. Signalling rides
+ * the channel via {@link Channel#publishEvent} on the same {@code rtc::}
+ * namespace those SDKs use — a plain PieSocket relay, no server-side
+ * special-casing — so an Android, a Flutter and a JS client can all be mixed in
+ * one room.
+ *
+ * <p><b>Handshake (collision-free, and not dependent on
+ * {@code onRenegotiationNeeded} for the first offer — it is unreliable on
+ * mobile):</b>
+ * <ul>
+ *   <li>Each client announces with {@code rtc::broadcaster} (or
+ *       {@code rtc::watcher}), and re-announces whenever a member joins, so a
+ *       peer already in the room hears a late joiner.</li>
+ *   <li>For every peer pair the client with the larger uuid is the <b>sole
+ *       offerer</b>: on hearing a peer it creates the connection and sends an
+ *       offer outright; the other side only ever answers, and pokes the offerer
+ *       with {@code rtc::request} (and, post-connection,
+ *       {@code rtc::renegotiate}).</li>
+ *   <li>At most one {@link PeerConnection} per remote peer; ICE candidates that
+ *       arrive before the remote description is applied are buffered and
+ *       flushed.</li>
+ * </ul>
  *
  * <p>Mutating operations are serialised on a single-thread executor;
  * {@code org.webrtc} observer callbacks (a different thread) re-post onto it.
  */
 public class PieRTC {
+
+    /** Result callback for {@link #switchCamera(OnCameraSwitch)}. */
+    public interface OnCameraSwitch {
+        void call(boolean isFrontCamera);
+    }
 
     final Channel channel;
     final PieRTCOptions identity;
@@ -75,12 +100,31 @@ public class PieRTC {
     private SurfaceTextureHelper screenHelper;
     private VideoTrack screenTrack;
 
-    private final Map<String, Participant> participants = new ConcurrentHashMap<>();
-    private final Map<String, Boolean> isNegotiating = new ConcurrentHashMap<>();
+    /** Current camera — starts at {@link PieRTCOptions#cameraFacing}. */
+    private boolean frontCamera = true;
+
+    /**
+     * Set once we have media (or are a no-media room) and have made our first
+     * announcement — gates {@link #onMemberJoined()} so we don't announce
+     * before we can carry the call.
+     */
+    private boolean announced = false;
+    private volatile boolean disposed = false;
+
+    private final ConcurrentHashMap<String, Participant> participants = new ConcurrentHashMap<>();
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
 
     private static class Participant {
         PeerConnection rtc;
+        /** True when this client is the designated offerer for the peer. */
+        boolean amOfferer;
+        /** An offer we've sent and not yet had answered. */
+        boolean makingOffer;
+        /** True once a remote description is applied (candidates can flush). */
+        boolean remoteDescriptionSet;
+        final List<IceCandidate> pendingCandidates = new ArrayList<>();
+        /** Stream ids already surfaced through onParticipantJoined. */
+        final Set<String> announcedStreams = new HashSet<>();
     }
 
     public PieRTC(Channel channel, PieRTCOptions identity, Logger logger) {
@@ -93,6 +137,8 @@ public class PieRTC {
             throw new IllegalStateException(
                     "PieRTCOptions.context is required — pass the application Context.");
         }
+
+        this.frontCamera = !"environment".equals(identity.cameraFacing);
 
         ensureFactoryInitialized(this.context);
         this.eglBase = EglBase.create();
@@ -123,6 +169,24 @@ public class PieRTC {
     /** The shared EGL context — pass to {@code SurfaceViewRenderer.init(...)}. */
     public EglBase.Context getEglBaseContext() {
         return eglBase.getEglBaseContext();
+    }
+
+    /** Current camera — kept in sync by {@link #switchCamera(OnCameraSwitch)}. */
+    public boolean isFrontCamera() {
+        return frontCamera;
+    }
+
+    /**
+     * Deterministic, symmetric offerer rule — both sides compute the same
+     * answer, by code-unit order (matches Dart {@code String.compareTo} and the
+     * JS SDK), so the SDKs agree on the offerer in a mixed room.
+     */
+    static boolean isOffererByUuid(String self, String peer) {
+        return self != null && peer != null && self.compareTo(peer) > 0;
+    }
+
+    private boolean amOffererFor(String peer) {
+        return isOffererByUuid(channel.uuid, peer);
     }
 
     // ===== Local media =====
@@ -171,15 +235,17 @@ public class PieRTC {
                 ? new Camera2Enumerator(context)
                 : new Camera1Enumerator(true);
 
-        for (String name : enumerator.getDeviceNames()) {
-            if (enumerator.isFrontFacing(name)) {
+        String[] names = enumerator.getDeviceNames();
+        // Preferred facing first.
+        for (String name : names) {
+            if (enumerator.isFrontFacing(name) == frontCamera) {
                 VideoCapturer capturer = enumerator.createCapturer(name, null);
                 if (capturer != null) {
                     return capturer;
                 }
             }
         }
-        for (String name : enumerator.getDeviceNames()) {
+        for (String name : names) {
             VideoCapturer capturer = enumerator.createCapturer(name, null);
             if (capturer != null) {
                 return capturer;
@@ -196,9 +262,49 @@ public class PieRTC {
         requestPeerVideo();
     }
 
+    /**
+     * Flip between the front and rear camera on the live call — the same track
+     * keeps streaming from the other lens, no renegotiation. {@code callback}
+     * (nullable) receives the new {@link #isFrontCamera()} value.
+     */
+    public void switchCamera(final OnCameraSwitch callback) {
+        executor.execute(() -> {
+            if (!(cameraCapturer instanceof CameraVideoCapturer)) {
+                if (callback != null) {
+                    callback.call(frontCamera);
+                }
+                return;
+            }
+            ((CameraVideoCapturer) cameraCapturer).switchCamera(
+                    new CameraVideoCapturer.CameraSwitchHandler() {
+                        @Override
+                        public void onCameraSwitchDone(boolean isFront) {
+                            frontCamera = isFront;
+                            if (callback != null) {
+                                callback.call(isFront);
+                            }
+                        }
+
+                        @Override
+                        public void onCameraSwitchError(String error) {
+                            logger.log("PieRTC: switchCamera failed: " + error);
+                            if (callback != null) {
+                                callback.call(frontCamera);
+                            }
+                        }
+                    });
+        });
+    }
+
+    /** @see #switchCamera(OnCameraSwitch) */
+    public void switchCamera() {
+        switchCamera(null);
+    }
+
     // ===== Signalling =====
 
     void requestPeerVideo() {
+        announced = true;
         String eventName = identity.shouldBroadcast ? "rtc::broadcaster" : "rtc::watcher";
         channel.publishEvent(eventName, obj(
                 "from", channel.uuid,
@@ -212,6 +318,19 @@ public class PieRTC {
     }
 
     /**
+     * A member joined the room — re-announce so a peer already here learns
+     * about this client (and vice versa), and a late joiner triggers a fresh
+     * offer.
+     */
+    public void onMemberJoined() {
+        executor.execute(() -> {
+            if (announced) {
+                requestPeerVideo();
+            }
+        });
+    }
+
+    /**
      * Handle an inbound {@code rtc::*} signalling frame — {@link Channel}
      * forwards every event here; non-{@code rtc::} events are ignored.
      */
@@ -220,25 +339,20 @@ public class PieRTC {
             return;
         }
         String from = data.optString("from", null);
-        String to = data.optString("to", null);
         boolean fromSelf = channel.uuid.equals(from);
-        boolean toSelf = channel.uuid.equals(to);
+        boolean toSelf = channel.uuid.equals(data.optString("to", null));
 
         switch (eventName) {
             case "rtc::broadcaster":
+            case "rtc::watcher":
+            case "rtc::request":
                 if (!fromSelf) {
-                    executor.execute(this::requestOfferFromPeer);
+                    executor.execute(() -> onPeerSignal(data));
                 }
                 break;
             case "rtc::stopped_screen":
                 if (!fromSelf) {
                     onRemoteScreenStopped(from, data.optString("streamId", null));
-                }
-                break;
-            case "rtc::watcher":
-            case "rtc::request":
-                if (!fromSelf) {
-                    executor.execute(() -> shareVideo(data, true));
                 }
                 break;
             case "rtc::candidate":
@@ -256,21 +370,52 @@ public class PieRTC {
                     executor.execute(() -> handleAnswer(data));
                 }
                 break;
+            case "rtc::renegotiate":
+                if (toSelf) {
+                    final String peer = from;
+                    executor.execute(() -> renegotiate(peer));
+                }
+                break;
             default:
                 break;
         }
     }
 
-    private void shareVideo(JSONObject signal, boolean isCaller) {
-        final String from = signal.optString("from", null);
-        if (from == null) {
+    /**
+     * A peer announced itself ({@code rtc::broadcaster}/{@code rtc::watcher}) or
+     * asked us for an offer ({@code rtc::request}). The whole handshake trigger.
+     */
+    private void onPeerSignal(JSONObject signal) {
+        String from = signal.optString("from", null);
+        if (from == null || from.equals(channel.uuid)) {
             return;
         }
+        if (amOffererFor(from)) {
+            sendOffer(from);
+        } else {
+            // The peer is the offerer — make sure it knows we're here.
+            requestOfferFromPeer();
+        }
+    }
 
-        if (!identity.shouldBroadcast && isCaller && !signal.optBoolean("isBroadcasting", false)) {
-            logger.log("Refusing to call, denied broadcast request");
+    /** The peer poked us (its designated offerer) for a fresh offer. */
+    private void renegotiate(String from) {
+        if (!amOffererFor(from)) {
             return;
         }
+        sendOffer(from);
+    }
+
+    private Participant ensurePeer(String from) {
+        Participant existing = participants.get(from);
+        if (existing != null && existing.rtc != null) {
+            return existing;
+        }
+        return createPeer(from);
+    }
+
+    private Participant createPeer(final String from) {
+        logger.log("PieRTC: creating peer connection for " + from);
 
         PeerConnection.RTCConfiguration config = new PeerConnection.RTCConfiguration(iceServers);
         config.sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN;
@@ -278,6 +423,8 @@ public class PieRTC {
                 PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY;
 
         final Participant participant = new Participant();
+        participant.amOfferer = amOffererFor(from);
+        participants.put(from, participant);
 
         PeerConnection pc = factory.createPeerConnection(config, new RtcObserver() {
             @Override
@@ -293,36 +440,39 @@ public class PieRTC {
 
             @Override
             public void onAddTrack(RtpReceiver receiver, MediaStream[] mediaStreams) {
-                MediaStreamTrack track = receiver.track();
-                if (!(track instanceof VideoTrack) || mediaStreams.length == 0) {
+                if (mediaStreams.length == 0) {
                     return;
                 }
-                if (identity.onParticipantJoined != null) {
-                    identity.onParticipantJoined.call(from, mediaStreams[0]);
-                }
+                announceStream(from, participant, mediaStreams[0]);
             }
 
             @Override
             public void onAddStream(MediaStream stream) {
-                if (!stream.videoTracks.isEmpty() && identity.onParticipantJoined != null) {
-                    identity.onParticipantJoined.call(from, stream);
-                }
-            }
-
-            @Override
-            public void onSignalingChange(PeerConnection.SignalingState state) {
-                isNegotiating.put(from, state != PeerConnection.SignalingState.STABLE);
+                announceStream(from, participant, stream);
             }
 
             @Override
             public void onRenegotiationNeeded() {
-                executor.execute(() -> sendVideoOffer(from));
+                executor.execute(() -> {
+                    // Only after the first connection — the first offer is
+                    // sent explicitly, not via this callback.
+                    if (!participant.remoteDescriptionSet) {
+                        return;
+                    }
+                    if (participant.amOfferer) {
+                        sendOffer(from);
+                    } else {
+                        channel.publishEvent("rtc::renegotiate", obj(
+                                "from", channel.uuid, "to", from), null);
+                    }
+                });
             }
         });
 
         if (pc == null) {
             logger.log("PieRTC: failed to create peer connection for " + from);
-            return;
+            participants.remove(from);
+            return null;
         }
         participant.rtc = pc;
 
@@ -333,8 +483,17 @@ public class PieRTC {
             addStreamTracks(pc, displayStream);
         }
 
-        isNegotiating.put(from, false);
-        participants.put(from, participant);
+        return participant;
+    }
+
+    private void announceStream(String from, Participant participant, MediaStream stream) {
+        if (stream == null) {
+            return;
+        }
+        if (participant.announcedStreams.add(stream.getId())
+                && identity.onParticipantJoined != null) {
+            identity.onParticipantJoined.call(from, stream);
+        }
     }
 
     private void addStreamTracks(PeerConnection pc, MediaStream stream) {
@@ -347,18 +506,18 @@ public class PieRTC {
         }
     }
 
-    private void sendVideoOffer(String from) {
-        Participant participant = participants.get(from);
-        if (participant == null || participant.rtc == null) {
+    private void sendOffer(final String from) {
+        final Participant participant = ensurePeer(from);
+        if (participant == null || participant.rtc == null || participant.makingOffer) {
             return;
         }
-        if (Boolean.TRUE.equals(isNegotiating.get(from))) {
-            logger.log("SKIP nested negotiations");
-            return;
-        }
-        isNegotiating.put(from, true);
-
         final PeerConnection pc = participant.rtc;
+        PeerConnection.SignalingState state = pc.signalingState();
+        if (state != null && state != PeerConnection.SignalingState.STABLE) {
+            return;
+        }
+        participant.makingOffer = true;
+
         pc.createOffer(new SimpleSdpObserver() {
             @Override
             public void onCreateSuccess(SessionDescription desc) {
@@ -372,24 +531,19 @@ public class PieRTC {
                                         "type", desc.type.canonicalForm(),
                                         "sdp", desc.description)), null);
                     }
+
+                    @Override
+                    public void onSetFailure(String s) {
+                        executor.execute(() -> participant.makingOffer = false);
+                    }
                 }, desc);
             }
-        }, new MediaConstraints());
-    }
 
-    private void addIceCandidate(JSONObject signal) {
-        Participant participant = participants.get(signal.optString("from", null));
-        if (participant == null || participant.rtc == null) {
-            return;
-        }
-        JSONObject ice = signal.optJSONObject("ice");
-        if (ice == null) {
-            return;
-        }
-        participant.rtc.addIceCandidate(new IceCandidate(
-                ice.optString("sdpMid", null),
-                ice.optInt("sdpMLineIndex"),
-                ice.optString("candidate", null)));
+            @Override
+            public void onCreateFailure(String s) {
+                executor.execute(() -> participant.makingOffer = false);
+            }
+        }, new MediaConstraints());
     }
 
     private void createAnswer(JSONObject signal) {
@@ -397,71 +551,122 @@ public class PieRTC {
         if (from == null) {
             return;
         }
-
-        if (participants.get(from) == null || participants.get(from).rtc == null) {
-            logger.log("Starting call in createAnswer");
-            shareVideo(signal, false);
-        }
-
-        Participant participant = participants.get(from);
-        if (participant == null || participant.rtc == null) {
-            return;
-        }
-        final PeerConnection pc = participant.rtc;
-
         JSONObject sdp = signal.optJSONObject("sdp");
         if (sdp == null) {
             return;
         }
         final String sdpType = sdp.optString("type", "offer");
+        if (!"offer".equals(sdpType)) {
+            return;
+        }
+        if (amOffererFor(from)) {
+            // We're the offerer for this peer — a crossing offer is spurious.
+            logger.log("Ignoring offer from " + from + " — we are the offerer");
+            return;
+        }
+
+        final Participant participant = ensurePeer(from);
+        if (participant == null || participant.rtc == null) {
+            return;
+        }
+        final PeerConnection pc = participant.rtc;
+
         SessionDescription remote = new SessionDescription(
                 SessionDescription.Type.fromCanonicalForm(sdpType), sdp.optString("sdp", null));
 
         pc.setRemoteDescription(new SimpleSdpObserver() {
             @Override
             public void onSetSuccess() {
-                if (!"offer".equals(sdpType)) {
-                    return;
-                }
-                pc.createAnswer(new SimpleSdpObserver() {
-                    @Override
-                    public void onCreateSuccess(SessionDescription desc) {
-                        pc.setLocalDescription(new SimpleSdpObserver() {
-                            @Override
-                            public void onSetSuccess() {
-                                channel.publishEvent("rtc::answer", obj(
-                                        "from", channel.uuid,
-                                        "to", from,
-                                        "sdp", obj(
-                                                "type", desc.type.canonicalForm(),
-                                                "sdp", desc.description)), null);
-                            }
-                        }, desc);
-                    }
-                }, new MediaConstraints());
+                executor.execute(() -> {
+                    flushCandidates(participant);
+                    pc.createAnswer(new SimpleSdpObserver() {
+                        @Override
+                        public void onCreateSuccess(SessionDescription desc) {
+                            pc.setLocalDescription(new SimpleSdpObserver() {
+                                @Override
+                                public void onSetSuccess() {
+                                    channel.publishEvent("rtc::answer", obj(
+                                            "from", channel.uuid,
+                                            "to", from,
+                                            "sdp", obj(
+                                                    "type", desc.type.canonicalForm(),
+                                                    "sdp", desc.description)), null);
+                                }
+                            }, desc);
+                        }
+                    }, new MediaConstraints());
+                });
             }
         }, remote);
     }
 
     private void handleAnswer(JSONObject signal) {
-        Participant participant = participants.get(signal.optString("from", null));
+        final Participant participant = participants.get(signal.optString("from", null));
         if (participant == null || participant.rtc == null) {
+            return;
+        }
+        final PeerConnection pc = participant.rtc;
+        if (pc.signalingState() != PeerConnection.SignalingState.HAVE_LOCAL_OFFER) {
+            logger.log("Ignoring answer from " + signal.optString("from", null)
+                    + " — not expecting one");
             return;
         }
         JSONObject sdp = signal.optJSONObject("sdp");
         if (sdp == null) {
             return;
         }
-        participant.rtc.setRemoteDescription(new SimpleSdpObserver(), new SessionDescription(
+        SessionDescription remote = new SessionDescription(
                 SessionDescription.Type.fromCanonicalForm(sdp.optString("type", "answer")),
-                sdp.optString("sdp", null)));
+                sdp.optString("sdp", null));
+
+        pc.setRemoteDescription(new SimpleSdpObserver() {
+            @Override
+            public void onSetSuccess() {
+                executor.execute(() -> {
+                    participant.makingOffer = false;
+                    flushCandidates(participant);
+                });
+            }
+        }, remote);
+    }
+
+    private void addIceCandidate(JSONObject signal) {
+        Participant participant = participants.get(signal.optString("from", null));
+        if (participant == null) {
+            return;
+        }
+        JSONObject ice = signal.optJSONObject("ice");
+        if (ice == null) {
+            return;
+        }
+        IceCandidate candidate = new IceCandidate(
+                ice.optString("sdpMid", null),
+                ice.optInt("sdpMLineIndex"),
+                ice.optString("candidate", null));
+
+        if (participant.rtc == null || !participant.remoteDescriptionSet) {
+            participant.pendingCandidates.add(candidate);
+            return;
+        }
+        participant.rtc.addIceCandidate(candidate);
+    }
+
+    private void flushCandidates(Participant participant) {
+        participant.remoteDescriptionSet = true;
+        if (participant.pendingCandidates.isEmpty() || participant.rtc == null) {
+            participant.pendingCandidates.clear();
+            return;
+        }
+        for (IceCandidate candidate : participant.pendingCandidates) {
+            participant.rtc.addIceCandidate(candidate);
+        }
+        participant.pendingCandidates.clear();
     }
 
     /** A participant left the room — tear down their peer connection. */
     public void removeParticipant(String uuid) {
         executor.execute(() -> {
             Participant participant = participants.remove(uuid);
-            isNegotiating.remove(uuid);
             if (participant != null && participant.rtc != null) {
                 try {
                     participant.rtc.dispose();
@@ -619,7 +824,17 @@ public class PieRTC {
 
     // ===== Teardown =====
 
+    /**
+     * Tear the room down: close every peer connection and stop the local
+     * camera/mic (and any screen share) so nothing keeps capturing or streaming
+     * after the call ends. Called automatically when the channel is left; safe
+     * to call more than once.
+     */
     public void dispose() {
+        if (disposed) {
+            return;
+        }
+        disposed = true;
         executor.execute(() -> {
             teardownScreenShare(false);
             stopCapturer(cameraCapturer);
@@ -630,6 +845,7 @@ public class PieRTC {
                     } catch (Exception ignored) {
                     }
                 }
+                participant.pendingCandidates.clear();
             }
             participants.clear();
             try {

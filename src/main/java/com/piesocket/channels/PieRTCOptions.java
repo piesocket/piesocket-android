@@ -33,6 +33,13 @@ public class PieRTCOptions {
     public boolean video = false;
     public boolean audio = true;
 
+    /**
+     * Which camera to open for a {@link #video} room: {@code "user"} (front —
+     * the default, what a 1:1 call wants) or {@code "environment"} (rear). Flip
+     * it at runtime with {@link PieRTC#switchCamera(PieRTC.OnCameraSwitch)}.
+     */
+    public String cameraFacing = "user";
+
     public OnLocalVideo onLocalVideo;
     public OnParticipant onParticipantJoined;
     public OnParticipantLeft onParticipantLeft;

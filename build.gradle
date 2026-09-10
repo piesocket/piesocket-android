@@ -36,7 +36,7 @@ android {
 }
 
 group = "com.piesocket"
-version = "7.0.0"
+version = "7.1.0"
 
 mavenPublishing {
     pom {
