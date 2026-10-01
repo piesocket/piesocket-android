@@ -4,6 +4,22 @@
 
 ### Fixed
 
+**Reconnect could exhaust native threads under repeated connection loss** (or
+repeated connect/close cycles) — every reconnect opened a fresh OkHttp client,
+immediately, with no backoff. Reconnects now share one client and back off
+exponentially (1s–30s, jittered); an auth rejection (401/403) during the
+WebSocket upgrade stops reconnecting instead of looping forever. New
+`PieSocketOptions.setAutoReconnect(false)` disables automatic reconnection
+entirely.
+
+**PieRTC renegotiation only worked when the side that already owned the offer
+changed its own tracks** — screen share started by the *other* side of a 1:1
+call never reached its peer, since an SDP offer can only describe its
+creator's own media. Either side can now renegotiate once connected.
+`dispose()` could also throw if a signal arrived while a room was being torn
+down; it's now race-safe, and the camera-facing flag no longer gets out of
+sync when the requested facing isn't available.
+
 **PieRTC 1:1 calls now actually connect.** The handshake had several bugs:
 
 - **Join race** — a client that announced `rtc::broadcaster` before the other

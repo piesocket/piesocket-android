@@ -3,10 +3,7 @@
 Release guide for pushing a new version of this library to **Maven Central**
 (`com.piesocket:channels-sdk`).
 
-Current release: **7.0.0**. The version was realigned from the old `2.x`
-line to match the other PieSocket client SDKs (piesocket-js,
-piesocket-flutter); `7.0.0` is the release that follows `2.1.0` — see
-`CHANGELOG.md`.
+Current release: **7.1.0** — see `CHANGELOG.md`.
 
 Publishing is done by the [vanniktech `maven-publish`](https://github.com/vanniktech/gradle-maven-publish-plugin)
 plugin (`build.gradle`), targeting the Sonatype **Central Portal**
@@ -55,7 +52,7 @@ cd sdks/piesocket-android
 `./gradlew test` — that's expected.
 
 After `publishToMavenLocal`, check
-`~/.m2/repository/com/piesocket/channels-sdk/7.0.0/` — the `.aar`, the
+`~/.m2/repository/com/piesocket/channels-sdk/7.1.0/` — the `.aar`, the
 `.pom` (correct version, `io.github.webrtc-sdk:android` + `okhttp` as
 `compile`-scope deps), sources and javadoc jars, and a `.asc` signature next
 to each.
@@ -79,8 +76,8 @@ Central Portal search reflects it sooner.
 ```sh
 # from sdks/piesocket-android (its own repo: github.com/piesocket/piesocket-android, branch master)
 git add -A
-git commit -m "v7.0.0 - v4 protocol + PieRTC (WebRTC rooms), binary send, screen share"
-git tag v7.0.0
+git commit -m "v7.1.0 - reconnect backoff, PieRTC renegotiation/dispose fixes, camera controls"
+git tag v7.1.0
 git push origin master --tags
 ```
 

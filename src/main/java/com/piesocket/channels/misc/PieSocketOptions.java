@@ -18,6 +18,7 @@ public class PieSocketOptions {
     private String webSocketEndpoint;
     private String clusterDomain;
     private Boolean ssl;
+    private Boolean autoReconnect;
 
     public PieSocketOptions(){
         this.version = "3";
@@ -26,6 +27,7 @@ public class PieSocketOptions {
         this.presence = false;
         this.forceAuth = false;
         this.ssl = true;
+        this.autoReconnect = true;
     }
 
     public String getWebSocketEndpoint() {
@@ -138,6 +140,14 @@ public class PieSocketOptions {
 
     public void setSsl(Boolean ssl) {
         this.ssl = ssl;
+    }
+
+    public Boolean getAutoReconnect() {
+        return autoReconnect;
+    }
+
+    public void setAutoReconnect(Boolean autoReconnect) {
+        this.autoReconnect = autoReconnect;
     }
 
 }

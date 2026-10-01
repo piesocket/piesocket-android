@@ -14,8 +14,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 
 import okhttp3.OkHttpClient;
@@ -46,6 +48,8 @@ public class Connection extends WebSocketListener {
 
     private static final int CONTROL_TIMEOUT_MS = 10000;
     private static final int NORMAL_CLOSURE_STATUS = 1000;
+    private static final long RECONNECT_BASE_DELAY_MS = 1000;
+    private static final long RECONNECT_MAX_DELAY_MS = 30000;
 
     public String primaryChannelId;
     private final PieSocketOptions options;
@@ -62,8 +66,15 @@ public class Connection extends WebSocketListener {
     private boolean shouldReconnect = false;
     private boolean migrating = false;
     private boolean openedOnce = false;
+    private int reconnectAttempt = 0;
+    private ScheduledFuture<?> pendingReconnect;
 
     private final ScheduledExecutorService scheduler;
+
+    /** Shared across reconnects — a fresh client per reconnect leaks OkHttp's threads. */
+    private final OkHttpClient httpClient = new OkHttpClient.Builder()
+            .readTimeout(0, TimeUnit.MILLISECONDS)
+            .build();
 
     /** Set by PieSocket to learn when the primary channel's socket opens/fails. */
     public Runnable onPrimaryConnected;
@@ -309,6 +320,8 @@ public class Connection extends WebSocketListener {
      */
     public void migratePrimary(String newPrimaryId, String endpoint, String newUuid, String newJwt) {
         migrating = true;
+        cancelPendingReconnect();
+        reconnectAttempt = 0;
 
         WebSocket old = ws;
         if (old != null) {
@@ -335,6 +348,7 @@ public class Connection extends WebSocketListener {
 
     public void close() {
         shouldReconnect = false;
+        cancelPendingReconnect();
         try {
             if (ws != null) {
                 ws.close(NORMAL_CLOSURE_STATUS, null);
@@ -342,23 +356,23 @@ public class Connection extends WebSocketListener {
         } catch (Exception ignored) {
         }
         scheduler.shutdownNow();
+        httpClient.dispatcher().executorService().shutdown();
+        httpClient.connectionPool().evictAll();
     }
 
     // ===== Socket lifecycle =====
 
     private void connect(String endpoint) {
         logger.log("PieSocket: opening shared v4 connection: " + endpoint);
-        OkHttpClient client = new OkHttpClient.Builder()
-                .readTimeout(0, TimeUnit.MILLISECONDS)
-                .build();
         Request request = new Request.Builder().url(endpoint).build();
-        this.ws = client.newWebSocket(request, this);
+        this.ws = httpClient.newWebSocket(request, this);
     }
 
     @Override
     public void onOpen(WebSocket webSocket, Response response) {
         connected = true;
         shouldReconnect = true;
+        reconnectAttempt = 0;
 
         // Replay every secondary subscription (reconnect / primary migration).
         for (Map.Entry<String, Channel> entry : channels.entrySet()) {
@@ -473,6 +487,13 @@ public class Connection extends WebSocketListener {
     public void onFailure(WebSocket webSocket, Throwable t, Response response) {
         logger.log("PieSocket: connection error: " + t.getMessage());
 
+        if (response != null && (response.code() == 401 || response.code() == 403)) {
+            // Auth rejection during the WebSocket upgrade — retrying with the
+            // same credentials would just fail again, forever. Give up instead
+            // of looping (even with backoff) against a permanent rejection.
+            shouldReconnect = false;
+        }
+
         if (!connected && onPrimaryError != null) {
             onPrimaryError.call(t);
         }
@@ -493,9 +514,43 @@ public class Connection extends WebSocketListener {
             channel.fireEvent(new PieSocketEvent("system:closed"));
         }
 
-        if (shouldReconnect && !migrating) {
-            logger.log("PieSocket: reconnecting multiplexed connection");
-            connect(Channel.buildUrl(primaryChannelId, options, primaryUuid, primaryJwt));
+        if (shouldReconnect && !migrating && autoReconnectEnabled()) {
+            scheduleReconnect();
+        }
+    }
+
+    private boolean autoReconnectEnabled() {
+        Boolean v = options.getAutoReconnect();
+        return v == null || v;
+    }
+
+    /** Backs off exponentially with jitter instead of reconnecting immediately. */
+    private void scheduleReconnect() {
+        cancelPendingReconnect();
+        long delay = nextReconnectDelayMs();
+        logger.log("PieSocket: reconnecting multiplexed connection in " + delay + "ms");
+        try {
+            pendingReconnect = scheduler.schedule(() -> {
+                if (shouldReconnect && !migrating) {
+                    connect(Channel.buildUrl(primaryChannelId, options, primaryUuid, primaryJwt));
+                }
+            }, delay, TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException e) {
+            // close() shut the scheduler down concurrently — nothing to reconnect.
+        }
+    }
+
+    private long nextReconnectDelayMs() {
+        long capped = Math.min(RECONNECT_MAX_DELAY_MS,
+                (long) (RECONNECT_BASE_DELAY_MS * Math.pow(2, reconnectAttempt)));
+        reconnectAttempt++;
+        return ThreadLocalRandom.current().nextLong(capped + 1);
+    }
+
+    private void cancelPendingReconnect() {
+        if (pendingReconnect != null) {
+            pendingReconnect.cancel(false);
+            pendingReconnect = null;
         }
     }
 

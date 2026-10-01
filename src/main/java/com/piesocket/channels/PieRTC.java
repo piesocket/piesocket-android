@@ -36,42 +36,19 @@ import org.webrtc.VideoTrack;
 
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 
 /**
  * PieRTC — programmable WebRTC video/audio rooms over a v4 {@link Channel}.
- *
- * <p>Port of piesocket-js's {@code PieRTC.js} / piesocket-flutter's
- * {@code pie_rtc.dart}, adapted to the {@code org.webrtc} API. Signalling rides
- * the channel via {@link Channel#publishEvent} on the same {@code rtc::}
- * namespace those SDKs use — a plain PieSocket relay, no server-side
- * special-casing — so an Android, a Flutter and a JS client can all be mixed in
- * one room.
- *
- * <p><b>Handshake (collision-free, and not dependent on
- * {@code onRenegotiationNeeded} for the first offer — it is unreliable on
- * mobile):</b>
- * <ul>
- *   <li>Each client announces with {@code rtc::broadcaster} (or
- *       {@code rtc::watcher}), and re-announces whenever a member joins, so a
- *       peer already in the room hears a late joiner.</li>
- *   <li>For every peer pair the client with the larger uuid is the <b>sole
- *       offerer</b>: on hearing a peer it creates the connection and sends an
- *       offer outright; the other side only ever answers, and pokes the offerer
- *       with {@code rtc::request} (and, post-connection,
- *       {@code rtc::renegotiate}).</li>
- *   <li>At most one {@link PeerConnection} per remote peer; ICE candidates that
- *       arrive before the remote description is applied are buffered and
- *       flushed.</li>
- * </ul>
- *
- * <p>Mutating operations are serialised on a single-thread executor;
- * {@code org.webrtc} observer callbacks (a different thread) re-post onto it.
+ * Signalling rides {@code rtc::*} events on the channel. Larger-uuid peer is
+ * the sole initial offerer per pair (collision-free handshake); after
+ * connecting, either side may re-offer to renegotiate its own track changes.
+ * Mutations are serialised on a single-thread executor.
  */
 public class PieRTC {
 
@@ -116,15 +93,13 @@ public class PieRTC {
 
     private static class Participant {
         PeerConnection rtc;
-        /** True when this client is the designated offerer for the peer. */
-        boolean amOfferer;
         /** An offer we've sent and not yet had answered. */
         boolean makingOffer;
         /** True once a remote description is applied (candidates can flush). */
         boolean remoteDescriptionSet;
         final List<IceCandidate> pendingCandidates = new ArrayList<>();
-        /** Stream ids already surfaced through onParticipantJoined. */
-        final Set<String> announcedStreams = new HashSet<>();
+        /** Stream ids already surfaced — concurrent since WebRTC calls onAddTrack off-executor. */
+        final Set<String> announcedStreams = ConcurrentHashMap.newKeySet();
     }
 
     public PieRTC(Channel channel, PieRTCOptions identity, Logger logger) {
@@ -153,7 +128,7 @@ public class PieRTC {
                 PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer());
 
         logger.log("Initializing video room");
-        executor.execute(this::init);
+        post(this::init);
     }
 
     private static synchronized void ensureFactoryInitialized(Context context) {
@@ -187,6 +162,17 @@ public class PieRTC {
 
     private boolean amOffererFor(String peer) {
         return isOffererByUuid(channel.uuid, peer);
+    }
+
+    /** Submits to {@link #executor}, swallowing a race against {@link #dispose()}. */
+    private void post(Runnable task) {
+        if (disposed) {
+            return;
+        }
+        try {
+            executor.execute(task);
+        } catch (RejectedExecutionException ignored) {
+        }
     }
 
     // ===== Local media =====
@@ -248,6 +234,7 @@ public class PieRTC {
         for (String name : names) {
             VideoCapturer capturer = enumerator.createCapturer(name, null);
             if (capturer != null) {
+                frontCamera = enumerator.isFrontFacing(name);
                 return capturer;
             }
         }
@@ -268,7 +255,7 @@ public class PieRTC {
      * (nullable) receives the new {@link #isFrontCamera()} value.
      */
     public void switchCamera(final OnCameraSwitch callback) {
-        executor.execute(() -> {
+        post(() -> {
             if (!(cameraCapturer instanceof CameraVideoCapturer)) {
                 if (callback != null) {
                     callback.call(frontCamera);
@@ -323,7 +310,7 @@ public class PieRTC {
      * offer.
      */
     public void onMemberJoined() {
-        executor.execute(() -> {
+        post(() -> {
             if (announced) {
                 requestPeerVideo();
             }
@@ -347,7 +334,7 @@ public class PieRTC {
             case "rtc::watcher":
             case "rtc::request":
                 if (!fromSelf) {
-                    executor.execute(() -> onPeerSignal(data));
+                    post(() -> onPeerSignal(data));
                 }
                 break;
             case "rtc::stopped_screen":
@@ -357,23 +344,23 @@ public class PieRTC {
                 break;
             case "rtc::candidate":
                 if (toSelf) {
-                    executor.execute(() -> addIceCandidate(data));
+                    post(() -> addIceCandidate(data));
                 }
                 break;
             case "rtc::offer":
                 if (toSelf) {
-                    executor.execute(() -> createAnswer(data));
+                    post(() -> createAnswer(data));
                 }
                 break;
             case "rtc::answer":
                 if (toSelf) {
-                    executor.execute(() -> handleAnswer(data));
+                    post(() -> handleAnswer(data));
                 }
                 break;
             case "rtc::renegotiate":
                 if (toSelf) {
                     final String peer = from;
-                    executor.execute(() -> renegotiate(peer));
+                    post(() -> renegotiate(peer));
                 }
                 break;
             default:
@@ -423,7 +410,6 @@ public class PieRTC {
                 PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY;
 
         final Participant participant = new Participant();
-        participant.amOfferer = amOffererFor(from);
         participants.put(from, participant);
 
         PeerConnection pc = factory.createPeerConnection(config, new RtcObserver() {
@@ -453,18 +439,13 @@ public class PieRTC {
 
             @Override
             public void onRenegotiationNeeded() {
-                executor.execute(() -> {
-                    // Only after the first connection — the first offer is
-                    // sent explicitly, not via this callback.
+                post(() -> {
+                    // Only after the first connection; and whichever side's
+                    // tracks changed must send the new offer itself.
                     if (!participant.remoteDescriptionSet) {
                         return;
                     }
-                    if (participant.amOfferer) {
-                        sendOffer(from);
-                    } else {
-                        channel.publishEvent("rtc::renegotiate", obj(
-                                "from", channel.uuid, "to", from), null);
-                    }
+                    sendOffer(from);
                 });
             }
         });
@@ -534,14 +515,14 @@ public class PieRTC {
 
                     @Override
                     public void onSetFailure(String s) {
-                        executor.execute(() -> participant.makingOffer = false);
+                        post(() -> participant.makingOffer = false);
                     }
                 }, desc);
             }
 
             @Override
             public void onCreateFailure(String s) {
-                executor.execute(() -> participant.makingOffer = false);
+                post(() -> participant.makingOffer = false);
             }
         }, new MediaConstraints());
     }
@@ -559,8 +540,13 @@ public class PieRTC {
         if (!"offer".equals(sdpType)) {
             return;
         }
-        if (amOffererFor(from)) {
-            // We're the offerer for this peer — a crossing offer is spurious.
+
+        // Once connected, either side may legitimately re-offer (renegotiation).
+        // Before that, only the designated offerer may — an early crossing
+        // offer is spurious.
+        Participant existing = participants.get(from);
+        boolean renegotiation = existing != null && existing.remoteDescriptionSet;
+        if (!renegotiation && amOffererFor(from)) {
             logger.log("Ignoring offer from " + from + " — we are the offerer");
             return;
         }
@@ -571,13 +557,21 @@ public class PieRTC {
         }
         final PeerConnection pc = participant.rtc;
 
+        if (renegotiation && (participant.makingOffer
+                || pc.signalingState() != PeerConnection.SignalingState.STABLE)) {
+            // Both sides renegotiated at once — drop it, the next track
+            // change or re-announce retries.
+            logger.log("Ignoring colliding renegotiation offer from " + from);
+            return;
+        }
+
         SessionDescription remote = new SessionDescription(
                 SessionDescription.Type.fromCanonicalForm(sdpType), sdp.optString("sdp", null));
 
         pc.setRemoteDescription(new SimpleSdpObserver() {
             @Override
             public void onSetSuccess() {
-                executor.execute(() -> {
+                post(() -> {
                     flushCandidates(participant);
                     pc.createAnswer(new SimpleSdpObserver() {
                         @Override
@@ -622,7 +616,7 @@ public class PieRTC {
         pc.setRemoteDescription(new SimpleSdpObserver() {
             @Override
             public void onSetSuccess() {
-                executor.execute(() -> {
+                post(() -> {
                     participant.makingOffer = false;
                     flushCandidates(participant);
                 });
@@ -665,7 +659,7 @@ public class PieRTC {
 
     /** A participant left the room — tear down their peer connection. */
     public void removeParticipant(String uuid) {
-        executor.execute(() -> {
+        post(() -> {
             Participant participant = participants.remove(uuid);
             if (participant != null && participant.rtc != null) {
                 try {
@@ -714,7 +708,7 @@ public class PieRTC {
                 PieScreenCaptureService.stop(appContext);
                 return;
             }
-            executor.execute(() -> beginScreenCapture(data));
+            post(() -> beginScreenCapture(data));
         });
     }
 
@@ -734,7 +728,7 @@ public class PieRTC {
         }
         PieScreenCaptureService.start(context.getApplicationContext());
         final Intent data = mediaProjectionPermissionResult;
-        executor.execute(() -> beginScreenCapture(data));
+        post(() -> beginScreenCapture(data));
     }
 
     private void beginScreenCapture(Intent permissionData) {
@@ -742,7 +736,7 @@ public class PieRTC {
             screenCapturer = new ScreenCapturerAndroid(permissionData, new MediaProjection.Callback() {
                 @Override
                 public void onStop() {
-                    executor.execute(() -> teardownScreenShare(true));
+                    post(() -> teardownScreenShare(true));
                 }
             });
 
@@ -770,7 +764,7 @@ public class PieRTC {
 
     /** Stop screen sharing started by {@link #shareScreen()}. */
     public void stopScreenShare() {
-        executor.execute(() -> teardownScreenShare(true));
+        post(() -> teardownScreenShare(true));
     }
 
     private void teardownScreenShare(boolean announce) {
@@ -835,6 +829,8 @@ public class PieRTC {
             return;
         }
         disposed = true;
+        // Submitted directly, not via post() — disposed is already true above,
+        // and this is the one task that must still run despite that.
         executor.execute(() -> {
             teardownScreenShare(false);
             stopCapturer(cameraCapturer);
